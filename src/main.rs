@@ -1,7 +1,9 @@
+mod charging;
 mod decode;
 
 use btleplug::api::{Central, Manager as _, Peripheral, ScanFilter, WriteType};
 use btleplug::platform::Manager;
+use charging::calculate_charging_parameters;
 use decode::Decoder;
 use futures::stream::StreamExt;
 use std::error::Error;
@@ -23,8 +25,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // --- Task 1: Tenma PSU Controller ---
     tokio::spawn(async move {
-        println!("Initializing Tenma PSU on /dev/ttyACM0...");
-        let mut port = tokio_serial::new("/dev/ttyACM0", 9600)
+        // lsusb for Tenma 72-2605: Bus 004 Device 005: ID 0416:5011 Nuvoton USB Virtual COM
+        let vid = 0x0416;
+        let pid = 0x5011;
+
+        // Wait until the Tenma is physically plugged in and turned on
+        let port_path = loop {
+            if let Some(path) = find_port_path(vid, pid) {
+                println!("Tenma found on {}", path);
+                break path;
+            }
+            println!("Searching for Tenma (ID {:04x}:{:04x})...", vid, pid);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        };
+
+        let mut port = tokio_serial::new(&port_path, 9600)
             .open_native_async()
             .expect("Could not open Tenma Serial Port");
 
@@ -37,40 +52,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut actual_v = "N/A".to_string();
 
         while let Some(voltage) = v_rx.recv().await {
-            let target_v = if voltage < 13.6 {
-                // BULK: High push to overcome wire resistance
-                16.00
-            } else if voltage >= 14.2 {
-                // FLOAT: Battery is full, drop to a resting voltage
-                13.60
-            } else {
-                // ABSORPTION/TAPER: Close to full, move to standard charging voltage
-                14.40
-            };
-            let target_i = if voltage < 13.6 {
-                5.0
-            } else if voltage >= 14.2 {
-                0.1
-            } else {
-                (5.0 - ((voltage - 13.6) / 0.6) * 4.5).clamp(0.1, 5.0)
-            };
+            let params = calculate_charging_parameters(voltage);
 
-            let v_changed = (target_v - last_vset).abs() > 0.01;
-            let i_changed = (target_i - last_iset).abs() > 0.01;
+            let v_changed = (params.target_voltage - last_vset).abs() > 0.01;
+            let i_changed = (params.target_current - last_iset).abs() > 0.01;
 
             if v_changed || i_changed {
                 // --- CONTROL MODE ---
                 // If we are changing settings, we don't query.
                 // This gives the PSU 100% of its CPU to update the hardware.
                 if v_changed {
-                    let _ = port.try_write(format!("VSET1:{:.2}\n", target_v).as_bytes());
+                    let _ =
+                        port.try_write(format!("VSET1:{:.2}\n", params.target_voltage).as_bytes());
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    last_vset = target_v;
+                    last_vset = params.target_voltage;
                 }
                 if i_changed {
-                    let _ = port.try_write(format!("ISET1:{:.2}\n", target_i).as_bytes());
+                    let _ =
+                        port.try_write(format!("ISET1:{:.2}\n", params.target_current).as_bytes());
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    last_iset = target_i;
+                    last_iset = params.target_current;
                 }
                 // make sure output is enabled
                 let _ = port.try_write(b"OUT1\n");
@@ -98,14 +99,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
 
-            let phase = if target_v == 16.0 {
-                "BULK"
-            } else if target_v == 13.6 {
-                "FLOAT"
-            } else {
-                "TAPER"
-            };
-
             let display_vout = if actual_v == "UPDATING" || actual_v == "N/A" {
                 actual_v.clone()
             } else {
@@ -114,7 +107,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             println!(
                 ">>> [{}] Batt: {:.2}V | PSU VSET: {:.2}V | PSU VOUT: {} | Target: {:.2}A",
-                phase, voltage, target_v, display_vout, target_i
+                params.phase, voltage, params.target_voltage, display_vout, params.target_current
             );
         }
     });
@@ -147,6 +140,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         sleep(Duration::from_secs(5)).await;
     }
+}
+
+fn find_port_path(vid: u16, pid: u16) -> Option<String> {
+    tokio_serial::available_ports()
+        .ok()?
+        .into_iter()
+        .find_map(|p| {
+            if let tokio_serial::SerialPortType::UsbPort(info) = p.port_type {
+                if info.vid == vid && info.pid == pid {
+                    return Some(p.port_name);
+                }
+            }
+            None
+        })
 }
 
 async fn find_and_connect(
