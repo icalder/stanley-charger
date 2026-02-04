@@ -35,7 +35,7 @@ scp target/armv7-unknown-linux-gnueabihf/release/stanley-charger root@einstein:
 ## Run
 
 ```sh
-screen ./stanley-charger
+screen ./stanley-charger --limit 80
 # Ctrl+A D
 # Later...
 screen -r

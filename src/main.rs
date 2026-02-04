@@ -4,6 +4,7 @@ mod decode;
 use btleplug::api::{Central, Manager as _, Peripheral, ScanFilter, WriteType};
 use btleplug::platform::Manager;
 use charging::calculate_charging_parameters;
+use clap::Parser;
 use decode::Decoder;
 use futures::stream::StreamExt;
 use std::error::Error;
@@ -19,9 +20,24 @@ const BMS_TX_UUID: Uuid = uuid!("0000ff02-0000-1000-8000-00805f9b34fb");
 const BMS_SERVICE_UUID: Uuid = uuid!("0000ff00-0000-1000-8000-00805f9b34fb");
 const QUERY_BATTERY: [u8; 7] = [0xdd, 0xa5, 0x03, 0x00, 0xff, 0xfd, 0x77];
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Maximum battery charge percentage (SoC) limit
+    #[arg(short, long)]
+    limit: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BatteryData {
+    voltage: f32,
+    soc: u8,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let (v_tx, mut v_rx) = mpsc::channel::<f32>(10);
+    let args = Args::parse();
+    let (v_tx, mut v_rx) = mpsc::channel::<BatteryData>(10);
 
     // --- Task 1: Tenma PSU Controller ---
     tokio::spawn(async move {
@@ -50,9 +66,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut last_vset = 0.0_f32;
         let mut last_iset = 0.0_f32;
         let mut actual_v = "N/A".to_string();
+        let mut over_limit_count = 0;
+        let mut is_disconnected = false;
 
-        while let Some(voltage) = v_rx.recv().await {
-            let params = calculate_charging_parameters(voltage);
+        while let Some(data) = v_rx.recv().await {
+            if let Some(limit) = args.limit {
+                if data.soc >= limit {
+                    over_limit_count += 1;
+                } else {
+                    over_limit_count = 0;
+                }
+
+                if over_limit_count >= 3 && !is_disconnected {
+                    println!(
+                        "SoC limit reached ({}%) for 3 consecutive readings. Disconnecting PSU output.",
+                        data.soc
+                    );
+                    let _ = port.try_write(b"OUT0\n");
+                    is_disconnected = true;
+                }
+            }
+
+            if is_disconnected {
+                println!(
+                    ">>> [STOPPED] Batt: {:.2}V | SoC: {}% | PSU output disconnected",
+                    data.voltage, data.soc
+                );
+                continue;
+            }
+
+            let params = calculate_charging_parameters(data.voltage);
 
             let v_changed = (params.target_voltage - last_vset).abs() > 0.01;
             let i_changed = (params.target_current - last_iset).abs() > 0.01;
@@ -107,7 +150,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             println!(
                 ">>> [{}] Batt: {:.2}V | PSU VSET: {:.2}V | PSU VOUT: {} | Target: {:.2}A",
-                params.phase, voltage, params.target_voltage, display_vout, params.target_current
+                params.phase,
+                data.voltage,
+                params.target_voltage,
+                display_vout,
+                params.target_current
             );
         }
     });
@@ -193,7 +240,7 @@ async fn find_and_connect(
 
 async fn run_monitor_loop(
     bms: &btleplug::platform::Peripheral,
-    v_tx: mpsc::Sender<f32>,
+    v_tx: mpsc::Sender<BatteryData>,
 ) -> Result<(), Box<dyn Error>> {
     let mut decoder = Decoder::default();
     let mut notifications = bms.notifications().await?;
@@ -230,7 +277,12 @@ async fn run_monitor_loop(
                     "Battery Voltage: {:.2}V | Current: {:.2}A | SoC: {}%",
                     decoder.voltage, decoder.current, decoder.soc
                 );
-                let _ = v_tx.send(decoder.voltage).await;
+                let _ = v_tx
+                    .send(BatteryData {
+                        voltage: decoder.voltage,
+                        soc: decoder.soc,
+                    })
+                    .await;
                 break; // We have what we need for the charger
             }
         }
