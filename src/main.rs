@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (v_tx, mut v_rx) = mpsc::channel::<BatteryData>(10);
 
     // --- Task 1: Tenma PSU Controller ---
-    tokio::spawn(async move {
+    let mut psu_task = tokio::spawn(async move {
         // lsusb for Tenma 72-2605: Bus 004 Device 005: ID 0416:5011 Nuvoton USB Virtual COM
         let vid = 0x0416;
         let pid = 0x5011;
@@ -67,7 +67,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let mut last_iset = 0.0_f32;
         let mut actual_v = "N/A".to_string();
         let mut over_limit_count = 0;
-        let mut is_disconnected = false;
 
         while let Some(data) = v_rx.recv().await {
             if let Some(limit) = args.limit {
@@ -77,22 +76,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     over_limit_count = 0;
                 }
 
-                if over_limit_count >= 3 && !is_disconnected {
+                if over_limit_count >= 3 {
                     println!(
                         "SoC limit reached ({}%) for 3 consecutive readings. Disconnecting PSU output.",
                         data.soc
                     );
                     let _ = port.try_write(b"OUT0\n");
-                    is_disconnected = true;
+                    // Give a small delay to ensure the serial command is transmitted
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    return;
                 }
-            }
-
-            if is_disconnected {
-                println!(
-                    ">>> [STOPPED] Batt: {:.2}V | SoC: {}% | PSU output disconnected",
-                    data.voltage, data.soc
-                );
-                continue;
             }
 
             let params = calculate_charging_parameters(data.voltage);
@@ -149,9 +142,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             };
 
             println!(
-                ">>> [{}] Batt: {:.2}V | PSU VSET: {:.2}V | PSU VOUT: {} | Target: {:.2}A",
+                ">>> [{}] Batt: {:.2}V | SoC: {}% | PSU VSET: {:.2}V | PSU VOUT: {} | Target: {:.2}A",
                 params.phase,
                 data.voltage,
+                data.soc,
                 params.target_voltage,
                 display_vout,
                 params.target_current
@@ -169,23 +163,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("No BT adapter")?;
 
     loop {
-        let _ = adapter.start_scan(ScanFilter::default()).await;
+        tokio::select! {
+            _ = &mut psu_task => {
+                println!("Charging limit reached or PSU task ended. Exiting.");
+                return Ok(());
+            }
+            _ = async {
+                let _ = adapter.start_scan(ScanFilter::default()).await;
 
-        match find_and_connect(&adapter).await {
-            Ok(bms) => {
-                // Notifications stream is created INSIDE this function
-                // and will be dropped immediately if it returns an error.
-                if let Err(e) = run_monitor_loop(&bms, v_tx.clone()).await {
-                    eprintln!("BMS Error: {}. Cleaning up...", e);
+                match find_and_connect(&adapter).await {
+                    Ok(bms) => {
+                        // Notifications stream is created INSIDE this function
+                        // and will be dropped immediately if it returns an error.
+                        if let Err(e) = run_monitor_loop(&bms, v_tx.clone()).await {
+                            eprintln!("BMS Error: {}. Cleaning up...", e);
+                        }
+                        let _ = bms.disconnect().await;
+                    }
+                    Err(e) => {
+                        eprintln!("Connection failed: {}. Resetting adapter...", e);
+                    }
                 }
-                let _ = bms.disconnect().await;
-            }
-            Err(e) => {
-                eprintln!("Connection failed: {}. Resetting adapter...", e);
-                // Optional: trigger system 'bluetoothctl remove' here
-            }
+                sleep(Duration::from_secs(5)).await;
+            } => {}
         }
-        sleep(Duration::from_secs(5)).await;
     }
 }
 
