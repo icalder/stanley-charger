@@ -25,11 +25,16 @@ pub struct Args {
     /// Maximum battery charge percentage (SoC) limit
     #[arg(short, long)]
     pub limit: Option<u8>,
+
+    /// Maximum charge current (Amperes)
+    #[arg(short = 'i', long)]
+    pub max_current: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct BatteryData {
     pub voltage: f32,
+    pub current: f32,
     pub soc: u8,
 }
 
@@ -155,6 +160,7 @@ async fn run_monitor_loop(
                 let _ = v_tx
                     .send(BatteryData {
                         voltage: decoder.voltage,
+                        current: decoder.current,
                         soc: decoder.soc,
                     })
                     .await;

@@ -61,7 +61,10 @@ pub async fn run_psu_task(mut v_rx: mpsc::Receiver<BatteryData>, args: Args) {
             }
         }
 
-        let params = calculate_charging_parameters(data.voltage);
+        let mut params = calculate_charging_parameters(data.voltage);
+        if let Some(max_i) = args.max_current {
+            params.target_current = params.target_current.min(max_i);
+        }
 
         let v_changed = (params.target_voltage - last_vset).abs() > 0.01;
         let i_changed = (params.target_current - last_iset).abs() > 0.01;
