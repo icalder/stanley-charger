@@ -1,3 +1,7 @@
+# Stanley Charger
+
+An automated battery charger that monitors BMS data via BLE and dynamically controls a Tenma programmable PSU to enforce custom SoC limits and multi-phase charging.
+
 ## Setup on Cerbo GX
 
 ```sh
