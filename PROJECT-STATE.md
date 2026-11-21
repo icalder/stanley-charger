@@ -3,7 +3,9 @@
 Inspection date: 2026-11-21, and this round is committed: `Cargo.toml`, `Cargo.lock`,
 `src/main.rs`, `src/tenma.rs`, `src/charging.rs`, `src/decode.rs` were modified, and
 `src/lib.rs`, `src/args.rs`, `src/battery_data.rs`, `src/psu.rs`, `src/charge_loop.rs` are
-new. `README.md` and this file follow in a second commit. 72 tests pass, ARM clippy is clean over `--all-targets`, `cargo fmt --check` is clean.
+new. `README.md` and this file follow in a second commit, and the supply-versus-battery
+current check came out in a third. 64 tests pass, ARM clippy is clean over `--all-targets`,
+`cargo fmt --check` is clean.
 The ARM binary is built, patched, and deployed to `root@einstein:stanley-charger`. The
 previous binary is kept on the Cerbo as `stanley-charger.prev`
 (md5 `0a43b305763f9809375aad4ac53092c3`, the build before the decoder rewrite).
@@ -27,9 +29,10 @@ whole `default` class. The driver now
 asserts raw mode at 9600 baud before every exchange and says so when it finds the settings
 had changed, because any root process can change them again.
 
-The other four changes closed the code gaps in the previous version of this document:
-verified writes, supervised output state, current reconciliation against the BMS, and safe
-shutdown on `Ctrl+C` and `SIGTERM`.
+The other three changes closed code gaps in the previous version of this document: verified
+writes, supervised output state, and safe shutdown on `Ctrl+C` and `SIGTERM`. A fourth,
+comparing the current the supply reports against the current the battery reports, was added
+in that round and has since been removed; see the gaps.
 
 ## The Report That Never Arrived
 
@@ -58,7 +61,7 @@ was flowing. The phone app agreed with the fresh reading all along.
 
 ## Code Map
 
-4040 lines including tests. `src/main.rs` no longer holds types or logic, so the charge
+3793 lines including tests. `src/main.rs` no longer holds types or logic, so the charge
 loop is testable without linking the BLE stack.
 
 | File | Lines | Tests | State |
@@ -69,7 +72,7 @@ loop is testable without linking the BLE stack.
 | `src/battery_data.rs` | 29 | 1 | The reading the charge loop consumes. |
 | `src/psu.rs` | 224 | 8 | `PowerSupply` trait, `OutputStatus`, and `PsuError`. Every operation is confirmed, so a fake can fail one of them on purpose. |
 | `src/tenma.rs` | 747 | 12 | Wire driver for one port handle: `TenmaLink`. `connect` waits for `0416:5011`, opens with `custom_args`, captures raw 9600 termios, handshakes with `*IDN?`, and switches the output off. Writes are confirmed by read-back. |
-| `src/charge_loop.rs` | 1457 | 26 | Charge policy and supervision: phases, setpoint writes, output state, stale BMS data, current reconciliation, silence and trust budgets, shutdown. |
+| `src/charge_loop.rs` | 1212 | 18 | Charge policy and supervision: phases, setpoint writes, output state, stale BMS data, silence and trust budgets, shutdown. |
 | `src/charging.rs` | 137 | 5 | BULK, TAPER, FLOAT. Pure. |
 | `src/decode.rs` | 846 | 15 | Reassembles frames from notifications, checks the end marker and the sum byte, dispatches on the command byte, and resynchronises after a lost fragment. `Frames` keeps the tally that tells a silent battery from a decoder reading nothing. |
 
@@ -139,8 +142,8 @@ supply was set by hand to 14.4 V and about 2 A:
   bytes dropped resynchronising, five frame starts for five queries, fragments 1 to 20
   bytes.
 - The charge loop now sees current moving. `Battery Voltage: 13.26V | Current: +2.77A |
-  SoC: 27% | Probe: 5.2C` against `PSU OUT: 14.84V 2.999A`. The two numbers agree, so the
-  reconciliation stays quiet, which is what agreement should do.
+  SoC: 27% | Probe: 5.2C` against `PSU OUT: 14.84V 2.999A`. Two meters on the same wire,
+  reading within 0.2 A of each other.
 - `SIGTERM` on a watching run stops it: `Stopped: stopped.`, the tally, then
   `Battery link released. A phone app can connect now.` `pkill` sends `SIGTERM`, which the
   watch loop used to ignore.
@@ -166,7 +169,7 @@ Seen on the bench on 2026-11-21 earlier in the day, after the firmware update: `
 connect. Before that run the BMS had held a dead link, and the reboot is what cleared it.
 
 Not yet seen in the field, though each is unit-tested: the termios repair message, the
-silence reopen, the trust halt, and the two current-reconciliation warnings. The stale-BMS
+silence reopen, and the trust halt. The stale-BMS
 failsafe was seen in the previous build: `No battery data for 90 s. Switching the PSU
 output off.` followed by `Battery data is back. Resuming charge.`
 
@@ -181,11 +184,16 @@ the first report, so the `0.00 A` beside a supply carrying 3 A was the reading t
 seconds after startup, before current flowed, repeated with fresh timestamps. With the
 reassembler in place the BMS reports 2.77 A against the supply's 2.999 A, and the phone app
 agreed with the BMS throughout. Nothing points at the shunt, the sense leads, or the
-wiring, and the reconciliation is quiet on a healthy charge, which is what it should be.
+wiring.
 
-What is left here is a threshold question rather than a fault: reconciliation compares both
-readings against a 0.05 A floor, so a supply carrying 3 A while the battery reports 0.4 A
-would pass. A ratio check would not.
+The comparison this gap grew into has been removed. It was written when the only evidence
+available was a decoder reading nothing, and once the frames were read properly the two
+meters agreed by themselves. Two meters that measure different things can disagree without
+anything being wrong, and the warning had no way to tell a wiring fault from a battery meter
+that simply counts a different path. What supervises the charge path now: every write is
+confirmed, the output state is checked against what charging wants, the supply's own
+readings are printed every cycle, and battery data that stops arriving switches the output
+off.
 
 ### 2. No logging or service manager
 
@@ -221,8 +229,9 @@ not add up becomes `Outcome::Corrupt`, which is counted and printed.
 2. Add timestamps to the output, and a way to restart the tool after a crash that does not
    need `/etc` writes.
 3. Move `TARGET_MAC` to a command-line argument.
-4. Turn the reconciliation zero check into a ratio check, now that both sides can be
-   trusted to speak.
+4. Print the mosfet state, which is decoded and thrown away. It is the reading that says
+   whether the charge path is open at all, which is what the removed current comparison was
+   trying to infer.
 5. Name the three unnamed fields in the status answer. The pack is at 5 C in a cold garage
    while taking 3 A; a low-temperature charge limit belongs in the charge loop if any of
    those fields turns out to be a second probe.

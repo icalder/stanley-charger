@@ -35,14 +35,6 @@ const BATTERY_STALE_BUDGET: Duration = Duration::from_secs(90);
 /// Consecutive readings at or above the SoC limit before charging is stopped.
 const LIMIT_READINGS: u8 = 3;
 
-/// A current at or below this is read as "not flowing". Both meters report exactly
-/// `0.000` when idle, so this only has to clear measurement noise, while staying
-/// below the 0.1 A maintenance current of the FLOAT phase.
-const IDLE_CURRENT: f32 = 0.05;
-
-/// How long the three current figures may disagree before it is reported.
-const CURRENT_ALERT_BUDGET: Duration = Duration::from_secs(30);
-
 /// Setpoint change small enough to ignore. Rewriting the supply's setpoints every
 /// cycle would wear out its configuration memory for nothing.
 const SETPOINT_DEADBAND: f32 = 0.01;
@@ -167,7 +159,6 @@ struct ChargeSession {
     last_reported: String,
     over_limit_count: u8,
     waiting_for_battery: bool,
-    current_watch: CurrentReconciliation,
     unconfirmed_since: Option<Instant>,
     last_answer: Instant,
 }
@@ -182,7 +173,6 @@ impl Default for ChargeSession {
             last_reported: String::from("N/A"),
             over_limit_count: 0,
             waiting_for_battery: false,
-            current_watch: CurrentReconciliation::default(),
             unconfirmed_since: None,
             last_answer: Instant::now(),
         }
@@ -451,15 +441,6 @@ impl<P: PowerSupply> Controller<'_, P> {
         self.session.note_answered();
         self.session.last_reported = format!("{:.2}V {:.3}A", volts, amps);
 
-        if let Some(alert) = self.session.current_watch.observe(
-            Instant::now(),
-            reading.params.target_current,
-            amps,
-            reading.data.current,
-        ) {
-            eprintln!("WARNING: {alert}");
-        }
-
         println!(
             ">>> [{}] Batt: {:.2}V {:.2}A | SoC: {}% | PSU VSET: {:.2}V | PSU OUT: {} | Target: {:.2}A",
             reading.params.phase,
@@ -524,7 +505,6 @@ impl<P: PowerSupply> Controller<'_, P> {
         // supply, so program it again and switch the output back on.
         self.session.waiting_for_battery = false;
         self.session.forget_state();
-        self.session.current_watch.reset();
         println!("Battery data is back. Resuming charge.");
     }
 
@@ -567,7 +547,6 @@ impl<P: PowerSupply> Controller<'_, P> {
         match self.psu.disable_output().await {
             Ok(()) => {
                 self.session.note_confirmed();
-                self.session.current_watch.reset();
                 Ok(())
             }
             Err(PsuError::Port(reason)) => Err(self.port_failed(&reason)),
@@ -581,120 +560,6 @@ impl<P: PowerSupply> Controller<'_, P> {
     fn port_failed(&self, reason: &str) -> ControlOutcome {
         eprintln!("PSU port failed: {reason}");
         ControlOutcome::LinkLost
-    }
-}
-
-/// Watches the gap between what is commanded, what the supply delivers, and what the
-/// battery receives.
-///
-/// Disagreement between those three is how a broken charge path shows up. The supply
-/// can sit at its current limit while the battery's own meter reads zero, which is
-/// either a wiring fault or a battery meter that does not cover the charge path —
-/// only the person holding the multimeter can tell which, so this reports rather
-/// than stopping.
-#[derive(Debug, Default)]
-pub struct CurrentReconciliation {
-    supply_quiet_since: Option<Instant>,
-    battery_quiet_since: Option<Instant>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum CurrentAlert {
-    /// Current was commanded and the supply says it is delivering none.
-    SupplyDeliversNothing,
-    /// The supply is delivering current that the battery does not report.
-    PowerNotReachingBattery,
-}
-
-impl std::fmt::Display for CurrentAlert {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SupplyDeliversNothing => write!(
-                f,
-                "the supply has delivered no current for {} s although charging was commanded",
-                CURRENT_ALERT_BUDGET.as_secs()
-            ),
-            Self::PowerNotReachingBattery => write!(
-                f,
-                "the supply has delivered current for {} s that the battery has not reported; \
-                 check the wiring, or the battery meter may not cover the charge path",
-                CURRENT_ALERT_BUDGET.as_secs()
-            ),
-        }
-    }
-}
-
-impl CurrentReconciliation {
-    /// Compare the three current figures. Alerts re-arm, so a persistent fault is
-    /// repeated once per budget instead of every cycle.
-    pub fn observe(
-        &mut self,
-        now: Instant,
-        commanded_amps: f32,
-        supply_amps: f32,
-        battery_amps: f32,
-    ) -> Option<CurrentAlert> {
-        if commanded_amps <= IDLE_CURRENT {
-            self.reset();
-            return None;
-        }
-
-        Self::track(
-            &mut self.supply_quiet_since,
-            now,
-            supply_amps <= IDLE_CURRENT,
-        );
-
-        // A supply that delivers nothing explains a battery that sees nothing, so the
-        // battery is only watched while the supply is carrying current. Reporting both
-        // would describe one fault twice.
-        if self.supply_quiet_since.is_some() {
-            self.battery_quiet_since = None;
-        } else {
-            Self::track(
-                &mut self.battery_quiet_since,
-                now,
-                battery_amps <= IDLE_CURRENT,
-            );
-        }
-
-        if Self::due(&mut self.supply_quiet_since, now) {
-            return Some(CurrentAlert::SupplyDeliversNothing);
-        }
-
-        if Self::due(&mut self.battery_quiet_since, now) {
-            return Some(CurrentAlert::PowerNotReachingBattery);
-        }
-
-        None
-    }
-
-    fn track(timer: &mut Option<Instant>, now: Instant, quiet: bool) {
-        match (timer, quiet) {
-            (empty @ None, true) => *empty = Some(now),
-            (running @ Some(_), false) => *running = None,
-            _ => {}
-        }
-    }
-
-    /// True once the quiet period has run out, re-arming the timer so the same fault
-    /// is reported again after another budget rather than every cycle.
-    fn due(timer: &mut Option<Instant>, now: Instant) -> bool {
-        let Some(started) = *timer else {
-            return false;
-        };
-
-        if now - started < CURRENT_ALERT_BUDGET {
-            return false;
-        }
-
-        *timer = Some(now);
-        true
-    }
-
-    pub fn reset(&mut self) {
-        self.supply_quiet_since = None;
-        self.battery_quiet_since = None;
     }
 }
 
@@ -833,19 +698,13 @@ mod supply_double {
 mod tests {
     use super::supply_double::{self, MockSupply};
     use super::{
-        CURRENT_ALERT_BUDGET, ChargeSession, ControlOutcome, Controller, CurrentAlert,
-        CurrentReconciliation, IDLE_CURRENT, Reading, SETPOINT_DEADBAND, SILENCE_BUDGET,
+        ChargeSession, ControlOutcome, Controller, Reading, SETPOINT_DEADBAND, SILENCE_BUDGET,
         TRUST_BUDGET,
     };
     use crate::psu::PsuError;
     use crate::{Args, BatteryData};
-    use std::time::Duration;
     use tokio::sync::{mpsc, watch};
     use tokio::time::Instant;
-
-    fn at(base: Instant, seconds: u64) -> Instant {
-        base + Duration::from_secs(seconds)
-    }
 
     fn args(limit: Option<u8>, max_current: Option<f32>) -> Args {
         Args {
@@ -861,114 +720,6 @@ mod tests {
             current: 0.0,
             soc: 50,
         }
-    }
-
-    #[test]
-    fn nothing_is_reported_when_no_current_is_commanded() {
-        let base = Instant::now();
-        let mut watch = CurrentReconciliation::default();
-
-        for step in 0..10 {
-            let alert = watch.observe(at(base, step * 10), 0.0, 0.0, 0.0);
-            assert_eq!(alert, None, "a supply asked to stop is not a fault");
-        }
-    }
-
-    #[test]
-    fn a_healthy_charge_raises_nothing() {
-        let base = Instant::now();
-        let mut watch = CurrentReconciliation::default();
-
-        for step in 0..10 {
-            assert_eq!(watch.observe(at(base, step * 10), 3.0, 2.99, 2.97), None);
-        }
-    }
-
-    #[test]
-    fn the_maintenance_current_of_float_phase_counts_as_flowing() {
-        let base = Instant::now();
-        let mut watch = CurrentReconciliation::default();
-
-        // FLOAT asks for 0.1 A, so the idle floor must sit below it.
-        const _: () = assert!(IDLE_CURRENT < 0.1);
-
-        for step in 0..5 {
-            assert_eq!(watch.observe(at(base, step * 10), 0.1, 0.1, 0.1), None);
-        }
-    }
-
-    #[test]
-    fn a_supply_carrying_no_current_is_reported_after_the_budget() {
-        let base = Instant::now();
-        let mut watch = CurrentReconciliation::default();
-
-        assert_eq!(watch.observe(base, 3.0, 0.0, 0.0), None);
-        assert_eq!(watch.observe(at(base, 10), 3.0, 0.0, 0.0), None);
-        assert_eq!(watch.observe(at(base, 20), 3.0, 0.0, 0.0), None);
-        assert_eq!(
-            watch.observe(at(base, 30), 3.0, 0.0, 0.0),
-            Some(CurrentAlert::SupplyDeliversNothing),
-            "30 s of zero current at a 3 A command is a fault"
-        );
-    }
-
-    #[test]
-    fn the_current_the_supply_reads_but_the_battery_does_not_is_reported() {
-        // Measured on the bench: IOUT1? answered 2.999 A while the BMS read 0.00 A.
-        let base = Instant::now();
-        let mut watch = CurrentReconciliation::default();
-
-        assert_eq!(watch.observe(base, 3.0, 2.999, 0.0), None);
-        assert_eq!(watch.observe(at(base, 20), 3.0, 2.999, 0.0), None);
-        assert_eq!(
-            watch.observe(at(base, 30), 3.0, 2.999, 0.0),
-            Some(CurrentAlert::PowerNotReachingBattery)
-        );
-    }
-
-    #[test]
-    fn a_fault_stops_being_reported_once_current_flows() {
-        let base = Instant::now();
-        let mut watch = CurrentReconciliation::default();
-
-        watch.observe(base, 3.0, 0.0, 0.0);
-        assert_eq!(
-            watch.observe(at(base, 30), 3.0, 0.0, 0.0),
-            Some(CurrentAlert::SupplyDeliversNothing)
-        );
-
-        for step in 1..4 {
-            assert_eq!(
-                watch.observe(at(base, 30 + step * 10), 3.0, 2.85, 2.80),
-                None
-            );
-        }
-    }
-
-    #[test]
-    fn a_persistent_fault_is_repeated_once_per_budget() {
-        let base = Instant::now();
-        let mut watch = CurrentReconciliation::default();
-
-        watch.observe(base, 3.0, 0.0, 0.0);
-        assert_eq!(
-            watch.observe(at(base, 30), 3.0, 0.0, 0.0),
-            Some(CurrentAlert::SupplyDeliversNothing)
-        );
-        assert_eq!(watch.observe(at(base, 40), 3.0, 0.0, 0.0), None);
-        assert_eq!(
-            watch.observe(at(base, 60), 3.0, 0.0, 0.0),
-            Some(CurrentAlert::SupplyDeliversNothing)
-        );
-    }
-
-    #[test]
-    fn an_alert_names_the_commanded_current_and_budget() {
-        let text = CurrentAlert::SupplyDeliversNothing.to_string();
-
-        assert!(text.contains("30 s"), "got {text}");
-        assert!(text.contains("supply"), "got {text}");
-        assert_eq!(CURRENT_ALERT_BUDGET, Duration::from_secs(30));
     }
 
     #[test]

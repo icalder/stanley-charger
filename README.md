@@ -174,9 +174,6 @@ it says.
   seconds. The output is switched off first. Charging does not resume.
 - The tool answers the battery every 10 seconds and forwards what it reads. Fragments that
   complete nothing are normal, and are not reported.
-- The tool warns when the numbers do not add up. `PSU OUT` reading zero current while
-  charging is programmed, or carrying current the BMS does not report, is printed as a
-  WARNING. The tool keeps charging, because the cause is usually wiring and not software.
 
 ## Requirements
 
