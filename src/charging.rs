@@ -51,3 +51,87 @@ pub fn calculate_charging_parameters(battery_voltage: f32) -> ChargingParameters
         phase,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BULK_VOLTAGE, FLOAT_CURRENT, FLOAT_START_VOLTAGE, FLOAT_VOLTAGE, MAX_CHARGE_CURRENT,
+        TAPER_START_VOLTAGE, TAPER_VOLTAGE, calculate_charging_parameters,
+    };
+
+    fn targets(volts: f32) -> (f32, f32, &'static str) {
+        let params = calculate_charging_parameters(volts);
+        (params.target_voltage, params.target_current, params.phase)
+    }
+
+    #[test]
+    fn a_flat_battery_gets_the_full_bulk_push() {
+        assert_eq!(targets(12.0), (BULK_VOLTAGE, MAX_CHARGE_CURRENT, "BULK"));
+        assert_eq!(targets(10.5), (BULK_VOLTAGE, MAX_CHARGE_CURRENT, "BULK"));
+    }
+
+    #[test]
+    fn the_taper_window_holds_absorption_voltage_and_ramps_current_down() {
+        let (_, current_at_start, phase_at_start) = targets(TAPER_START_VOLTAGE);
+        assert_eq!(phase_at_start, "TAPER");
+        assert_eq!(current_at_start, MAX_CHARGE_CURRENT);
+
+        let (volts, current_mid, _) = targets(13.9);
+        assert_eq!(volts, TAPER_VOLTAGE);
+        assert!(
+            (current_mid - 1.55).abs() < 0.01,
+            "mid-window should be about half current, got {current_mid}"
+        );
+
+        let (volts_at_top, current_at_top, _) = targets(14.19);
+        assert_eq!(volts_at_top, TAPER_VOLTAGE);
+        assert!(
+            current_at_top > FLOAT_CURRENT,
+            "the ramp must not undershoot the maintenance current"
+        );
+    }
+
+    #[test]
+    fn a_full_battery_drops_to_maintenance() {
+        assert_eq!(
+            targets(FLOAT_START_VOLTAGE),
+            (FLOAT_VOLTAGE, FLOAT_CURRENT, "FLOAT")
+        );
+        assert_eq!(targets(14.6), (FLOAT_VOLTAGE, FLOAT_CURRENT, "FLOAT"));
+    }
+
+    #[test]
+    fn the_phases_meet_at_their_shared_voltage() {
+        // A gap between phases would make the supply jump as the battery crosses the
+        // boundary, so the current either side of each boundary has to be close.
+        let (_, below, _) = targets(TAPER_START_VOLTAGE - 0.01);
+        let (_, above, _) = targets(TAPER_START_VOLTAGE);
+        assert!(
+            (below - above).abs() < 0.2,
+            "current jumped {below} -> {above} across the BULK/TAPER boundary"
+        );
+
+        let (_, below, _) = targets(FLOAT_START_VOLTAGE - 0.01);
+        let (_, above, _) = targets(FLOAT_START_VOLTAGE);
+        assert!(
+            below < 0.4 && above == FLOAT_CURRENT,
+            "current jumped {below} -> {above} across the TAPER/FLOAT boundary"
+        );
+    }
+
+    #[test]
+    fn no_battery_voltage_produces_an_out_of_range_current() {
+        // The supply is set from these numbers, so they must stay inside what the
+        // pack and the supply are rated for.
+        let mut volts = 9.0;
+        while volts <= 16.0 {
+            let (_, current, phase) = targets(volts);
+            assert!(
+                (FLOAT_CURRENT..=MAX_CHARGE_CURRENT).contains(&current),
+                "at {volts:.2}V the current was {current}"
+            );
+            assert!(!phase.is_empty(), "at {volts:.2}V the phase was empty");
+            volts += 0.05;
+        }
+    }
+}
