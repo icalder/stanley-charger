@@ -6,9 +6,10 @@ Inspection date: 2026-11-21, and this round is committed: `Cargo.toml`, `Cargo.l
 new. `README.md` and this file follow in a second commit, and the supply-versus-battery
 current check came out in a third. 64 tests pass, ARM clippy is clean over `--all-targets`,
 `cargo fmt --check` is clean.
-The ARM binary is built, patched, and deployed to `root@einstein:stanley-charger`. The
-previous binary is kept on the Cerbo as `stanley-charger.prev`
-(md5 `0a43b305763f9809375aad4ac53092c3`, the build before the decoder rewrite).
+The ARM binary is built, patched, and deployed to `root@einstein:stanley-charger`
+(md5 `2c3f499c9ae76803f417f6f540e33c79`). No older binary is kept on the Cerbo: a
+`stanley-charger.prev` existed once and disappeared with the firmware update, and
+`make deploy` overwrites without keeping one. Git is the way back.
 
 ## What This Round Was About
 

@@ -280,6 +280,15 @@ and the interpreter in one step.
 A running binary cannot be overwritten; the copy fails with `Failure` while the tool is
 still up. Stop it first.
 
+Nothing keeps a way back. `make deploy` overwrites the binary on the Cerbo, and a binary
+left there for older testing was once cleared by a firmware update. When you want the option
+of going back, copy the current one aside first, and remember that git holds every build
+this repo has committed:
+
+```sh
+ssh root@einstein 'cp /data/home/root/stanley-charger /data/home/root/stanley-charger.prev'
+```
+
 ## Run
 
 ```sh
